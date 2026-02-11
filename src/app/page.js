@@ -1,65 +1,90 @@
-import Image from "next/image";
+// /Volumes/sunny-2025/nextjs-aiagent-2026/src/app/page.js
+"use client";
 
-export default function Home() {
+import { useRouter } from "next/navigation";
+
+export default function Page() {
+  const router = useRouter();
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.js file.
+    <main className="min-h-screen w-full overflow-hidden bg-black text-white">
+      {/* Background gradients */}
+      <div className="pointer-events-none fixed inset-0">
+        <div className="absolute -top-40 left-1/2 h-[520px] w-[520px] -translate-x-1/2 rounded-full bg-purple-500/30 blur-3xl" />
+        <div className="absolute top-24 left-[-120px] h-[520px] w-[520px] rounded-full bg-fuchsia-500/20 blur-3xl" />
+        <div className="absolute bottom-[-200px] right-[-140px] h-[620px] w-[620px] rounded-full bg-indigo-500/25 blur-3xl" />
+        <div className="absolute inset-0 bg-gradient-to-b from-black/20 via-black/60 to-black" />
+      </div>
+
+      {/* Content */}
+      <div className="relative mx-auto flex min-h-screen max-w-6xl flex-col items-center justify-center px-4 py-10">
+        {/* Top text */}
+        <div className="mb-6 text-center">
+          <p className="mb-2 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-white/80">
+            🧠 Virtual Assistant Platform
+          </p>
+
+          <h1 className="text-balance text-3xl font-extrabold tracking-tight sm:text-4xl md:text-5xl">
+            Welcome to <span className="text-white/90">majubee</span>
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+
+          <p className="mx-auto mt-3 max-w-xl text-pretty text-sm text-white/70 sm:text-base">
+            Sign in to continue, or create an account to get started.
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+
+        {/* Video card */}
+        <div className="w-full max-w-md">
+          <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-white/5 shadow-2xl">
+            {/* Subtle gradient overlay for blending */}
+            <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/10 via-transparent to-black/40" />
+
+            <video
+              className="h-auto w-full object-cover"
+              src="/talkinghead1.mp4"
+              autoPlay
+              muted
+              loop
+              playsInline
+              preload="metadata"
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+
+            {/* Bottom fade to help buttons visually separate */}
+            <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-20 bg-gradient-to-t from-black/60 to-transparent" />
+          </div>
+
+          {/* Buttons */}
+          <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => router.push("/createaccount")}
+              className="inline-flex w-full items-center justify-center rounded-2xl bg-white px-4 py-4 text-sm font-extrabold text-black shadow-lg transition active:scale-[0.99]"
+            >
+              Create Account
+            </button>
+
+            <button
+              type="button"
+              onClick={() => router.push("/login")}
+              className="inline-flex w-full items-center justify-center rounded-2xl border border-white/15 bg-white/5 px-4 py-4 text-sm font-extrabold text-white shadow-lg backdrop-blur-md transition hover:bg-white/10 active:scale-[0.99]"
+            >
+              Sign In
+            </button>
+
+            <button
+              type="button"
+              onClick={() => router.push("/resetpassword")}
+              className="col-span-full inline-flex w-full items-center justify-center rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-medium text-white/90 transition hover:bg-white/10 active:scale-[0.99]"
+            >
+              Reset Password
+            </button>
+          </div>
+
+          {/* Tiny footer note */}
+          <p className="mt-5 text-center text-xs text-white/50">
+            By continuing, you agree to our terms & privacy policy.
+          </p>
         </div>
-      </main>
-    </div>
+      </div>
+    </main>
   );
 }
