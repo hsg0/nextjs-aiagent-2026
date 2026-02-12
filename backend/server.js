@@ -1,11 +1,13 @@
+import http from "http";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import cookieParser from "cookie-parser";
 import connectDB from "./config/mongoDB.js";
+import { createSocketServer } from "./config/socketServer.js";
 
 import authRouter from "./routes/auth/authRoutes.js";
-
+import googleGeminiAiRouter from "./routes/googleGeminiAi/googleGeminiAiRoutes.js";
 
 dotenv.config();
 
@@ -13,6 +15,7 @@ connectDB();
 
 const PORT = process.env.PORT || 4040;
 const app = express();
+const httpServer = http.createServer(app);
 
 app.set("trust proxy", 1);
 
@@ -51,7 +54,12 @@ app.get('/health', (req, res) => {
 // auth routes
 app.use('/api/v1/auth', authRouter);
 
-app.listen(PORT, () => {
+// google Gemini ai routes
+app.use('/api/v1/google-gemini-ai', googleGeminiAiRouter);
+
+createSocketServer(httpServer, allowedOrigins);
+
+httpServer.listen(PORT, () => {
     console.log(`Server is running at http://localhost:${PORT}`);
 });
 
