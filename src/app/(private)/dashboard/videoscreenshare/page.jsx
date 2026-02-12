@@ -1,10 +1,18 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useUser } from "../../../../context/UserContext";
 
 export default function VideoScreenSharePage() {
+  return (
+    <Suspense fallback={<div className="flex min-h-screen items-center justify-center bg-black text-white">Loading...</div>}>
+      <VideoScreenShareInner />
+    </Suspense>
+  );
+}
+
+function VideoScreenShareInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { user } = useUser();

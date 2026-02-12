@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { io as socketIOClient } from "socket.io-client";
 import axios from "axios";
@@ -15,13 +15,16 @@ const ICE_SERVERS = [
 
 // ─────────────────────────────────────────────────────────────
 // Video Call Room Page (Majubee Theme)
-// - Left thinner, center wider
-// - Mobile friendly layout
-// - Permission flow: mic first, then camera
-// - Double click self circle -> pin to main stage (and back)
-// - Fullscreen stage: dblclick or button + ESC exits
 // ─────────────────────────────────────────────────────────────
 export default function VideoCallRoomPage() {
+  return (
+    <Suspense fallback={<div className="flex min-h-screen items-center justify-center bg-black text-white">Loading...</div>}>
+      <VideoCallRoomInner />
+    </Suspense>
+  );
+}
+
+function VideoCallRoomInner() {
   const router = useRouter();
   const params = useParams();
   const searchParams = useSearchParams();
