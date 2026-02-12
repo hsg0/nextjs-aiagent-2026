@@ -91,29 +91,48 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
 
         socket.join(roomKey);
 
-        let room = await Room.findOne({ roomKey });
-        if (!room) room = await Room.create({ roomKey });
+        // Find the active session for this roomKey (if any)
+        let room = await Room.findOne({ roomKey, isActive: true });
 
-        // Prune stale participants whose sockets are no longer connected
-        const connectedSocketIds = new Set(io.sockets.sockets.keys());
-        const before = room.participants.length;
-        room.participants = room.participants.filter(
-          (p) => connectedSocketIds.has(p.socketId),
-        );
-        if (room.participants.length < before) {
-          console.log("[webrtcSocket] pruned", before - room.participants.length, "stale participants from", roomKey);
+        if (room) {
+          // Prune stale participants whose sockets are no longer connected
+          const connectedSocketIds = new Set(io.sockets.sockets.keys());
+          const before = room.participants.length;
+          room.participants = room.participants.filter(
+            (p) => connectedSocketIds.has(p.socketId),
+          );
+          if (room.participants.length < before) {
+            console.log("[webrtcSocket] pruned", before - room.participants.length, "stale participants from", roomKey);
 
-          // Also clean stale entries from agoraUidMappings
-          const roomMappings = agoraUidMappings.get(roomKey);
-          if (roomMappings) {
-            for (const mappedSid of roomMappings.keys()) {
-              if (!connectedSocketIds.has(mappedSid)) {
-                roomMappings.delete(mappedSid);
+            // Also clean stale entries from agoraUidMappings
+            const uidMap = agoraUidMappings.get(roomKey);
+            if (uidMap) {
+              for (const mappedSid of uidMap.keys()) {
+                if (!connectedSocketIds.has(mappedSid)) {
+                  uidMap.delete(mappedSid);
+                }
               }
+              if (uidMap.size === 0) agoraUidMappings.delete(roomKey);
             }
-            if (roomMappings.size === 0) agoraUidMappings.delete(roomKey);
+          }
+
+          // If after pruning the room is empty, close this session and start a fresh one
+          if (room.participants.length === 0) {
+            console.log("[webrtcSocket] stale session closed for", roomKey, "creating new session");
+            room.isActive = false;
+            await room.save();
+            room = null; // fall through to create a new session below
           }
         }
+
+        // No active session → create a brand-new Room document (new session)
+        if (!room) {
+          room = await Room.create({ roomKey });
+          console.log("[webrtcSocket] new session created for", roomKey, "sessionId:", room._id);
+        }
+
+        // Store session ID on the socket for use in chat:send
+        socket.roomSessionId = room._id.toString();
 
         // upsert participant by socketId
         const existingIndex = room.participants.findIndex(
@@ -173,9 +192,9 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
 
         socket.leave(roomKey);
 
-        // Atomically remove participant to avoid VersionError
+        // Atomically remove participant from the active session
         const room = await Room.findOneAndUpdate(
-          { roomKey },
+          { roomKey, isActive: true },
           { $pull: { participants: { socketId: socket.id } } },
           { new: true },
         );
@@ -191,6 +210,12 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
             text: `${socket.user?.name || "Someone"} left the room`,
             ts: Date.now(),
           });
+
+          // If room is now empty, close this session
+          if (room.participants.length === 0) {
+            await Room.findByIdAndUpdate(room._id, { isActive: false });
+            console.log("[webrtcSocket] session closed (empty after leave):", roomKey, "sessionId:", room._id);
+          }
         }
 
         // Clean up Agora UID mapping for the departing socket
@@ -214,8 +239,16 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
 
         if (!roomKey || !name || !trimmedText) return;
 
+        // Determine session ID: prefer the one stored on the socket, fallback to DB lookup
+        let sessionId = socket.roomSessionId;
+        if (!sessionId) {
+          const activeRoom = await Room.findOne({ roomKey, isActive: true });
+          sessionId = activeRoom?._id?.toString() || "";
+        }
+
         const savedMessage = await Message.create({
           roomKey,
+          sessionId,
           sender: { userId, name, email },
           text: trimmedText,
         });
@@ -270,14 +303,15 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
 
         const userName = socket.user?.name || "Someone";
 
-        // Atomically remove this socket from ALL rooms it was in
+        // Atomically remove this socket from ALL active rooms it was in
         const roomsWithSocket = await Room.find({
           "participants.socketId": socket.id,
+          isActive: true,
         });
 
         for (const roomDoc of roomsWithSocket) {
           const updatedRoom = await Room.findOneAndUpdate(
-            { roomKey: roomDoc.roomKey },
+            { _id: roomDoc._id, isActive: true },
             { $pull: { participants: { socketId: socket.id } } },
             { new: true },
           );
@@ -293,6 +327,12 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
               text: `${userName} disconnected`,
               ts: Date.now(),
             });
+
+            // If room is now empty, close this session
+            if (updatedRoom.participants.length === 0) {
+              await Room.findByIdAndUpdate(updatedRoom._id, { isActive: false });
+              console.log("[webrtcSocket] session closed (empty after disconnect):", roomDoc.roomKey, "sessionId:", updatedRoom._id);
+            }
           }
 
           // Clean up Agora UID mapping for the disconnected socket

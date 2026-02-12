@@ -5,6 +5,7 @@ const webDb = mongoose.connection.useDb("webrtcchat");
 const messageSchema = new mongoose.Schema(
   {
     roomKey: { type: String, required: true, index: true },
+    sessionId: { type: String, required: true, index: true },
     sender: {
       userId: { type: String, default: "" },
       name: { type: String, required: true },

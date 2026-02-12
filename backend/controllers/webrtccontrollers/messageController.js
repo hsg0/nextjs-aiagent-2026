@@ -1,4 +1,5 @@
 import Message from "../../models/webrtcchatmodels/message.js";
+import Room from "../../models/webrtcchatmodels/room.js";
 
 export async function listMessages(req, res) {
   try {
@@ -11,7 +12,17 @@ export async function listMessages(req, res) {
       return res.status(400).json({ ok: false, message: "Missing roomKey" });
     }
 
-    const messages = await Message.find({ roomKey })
+    // Only return messages for the current active session
+    const activeRoom = await Room.findOne({ roomKey, isActive: true });
+    if (!activeRoom) {
+      // No active session → fresh state, no messages to show
+      return res.json({ ok: true, messages: [] });
+    }
+
+    const messages = await Message.find({
+      roomKey,
+      sessionId: activeRoom._id.toString(),
+    })
       .sort({ createdAt: 1 })
       .limit(limit);
 

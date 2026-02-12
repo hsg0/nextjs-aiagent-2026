@@ -17,12 +17,15 @@ const participantSchema = new mongoose.Schema(
 
 const roomSchema = new mongoose.Schema(
   {
-    roomKey: { type: String, required: true, unique: true, index: true },
+    roomKey: { type: String, required: true, index: true },
     createdBy: { type: String, default: "" },
     isActive: { type: Boolean, default: true },
     participants: { type: [participantSchema], default: [] },
   },
   { timestamps: true }
 );
+
+// Compound index for the common query: find active room by roomKey
+roomSchema.index({ roomKey: 1, isActive: 1 });
 
 export default webDb.model("WebRTC_Room", roomSchema);
