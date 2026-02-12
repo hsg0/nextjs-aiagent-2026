@@ -5,9 +5,12 @@ import dotenv from "dotenv";
 import cookieParser from "cookie-parser";
 import connectDB from "./config/mongoDB.js";
 import { createSocketServer } from "./config/socketServer.js";
+import { initWebRTCSocketServer } from "./config/webrtcSocketServer.js";
 
 import authRouter from "./routes/auth/authRoutes.js";
 import googleGeminiAiRouter from "./routes/googleGeminiAi/googleGeminiAiRoutes.js";
+import webrtcRoomRoutes from "./routes/webrtcroutes/roomRoutes.js";
+import webrtcMessageRoutes from "./routes/webrtcroutes/messageRoutes.js";
 
 dotenv.config();
 
@@ -57,7 +60,15 @@ app.use('/api/v1/auth', authRouter);
 // google Gemini ai routes
 app.use('/api/v1/google-gemini-ai', googleGeminiAiRouter);
 
+// webrtc room + message REST routes
+app.use('/webrtc/rooms', webrtcRoomRoutes);
+app.use('/webrtc/messages', webrtcMessageRoutes);
+
+// AI socket (default path /socket.io)
 createSocketServer(httpServer, allowedOrigins);
+
+// WebRTC socket (separate path /socket.io-webrtc)
+initWebRTCSocketServer(httpServer, { allowedOrigins, socketPath: "/socket.io-webrtc" });
 
 httpServer.listen(PORT, () => {
     console.log(`Server is running at http://localhost:${PORT}`);
