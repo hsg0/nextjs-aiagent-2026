@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useContext, useEffect, useState, useRef } from "react";
+import { Suspense, createContext, useContext, useEffect, useState, useRef } from "react";
 import { useRouter, useParams, useSearchParams } from "next/navigation";
 import { ToastContainer, toast } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
@@ -199,7 +199,13 @@ function PrivateShell({ children }) {
 export default function PrivateLayout({ children }) {
   return (
     <UserProvider>
-      <PrivateShell>{children}</PrivateShell>
+      <Suspense fallback={
+        <div className="flex min-h-screen items-center justify-center bg-black text-white">
+          <p className="animate-pulse text-sm text-white/70">Loading...</p>
+        </div>
+      }>
+        <PrivateShell>{children}</PrivateShell>
+      </Suspense>
     </UserProvider>
   );
 }
