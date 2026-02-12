@@ -21,6 +21,8 @@ function parseCookie(cookieHeader) {
 }
 
 // ── WebRTC Socket Server ─────────────────────────────────────
+// Handles: room lifecycle, chat, and Agora UID mapping.
+// Media transport (audio/video/screen) is handled entirely by Agora SDK.
 export function initWebRTCSocketServer(httpServer, options = {}) {
   const {
     allowedOrigins = [],
@@ -37,11 +39,9 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
 
   console.log("[webrtcSocket] socket server initialized. path:", socketPath);
 
-  // ── In-memory tracker: which room has an active screen sharer ──
-  const activeSharers = new Map(); // roomKey → { socketId, name }
-
-  // ── In-memory tracker: which sockets have camera/mic ready per room ──
-  const cameraReadyUsers = new Map(); // roomKey → Set<socketId>
+  // ── In-memory Agora UID mappings per room ───────────────
+  // roomKey → Map<socketId, { agoraUid, name }>
+  const agoraUidMappings = new Map();
 
   // ── JWT auth middleware (same as AI socket) ─────────────
   io.use(async (socket, next) => {
@@ -94,6 +94,27 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
         let room = await Room.findOne({ roomKey });
         if (!room) room = await Room.create({ roomKey });
 
+        // Prune stale participants whose sockets are no longer connected
+        const connectedSocketIds = new Set(io.sockets.sockets.keys());
+        const before = room.participants.length;
+        room.participants = room.participants.filter(
+          (p) => connectedSocketIds.has(p.socketId),
+        );
+        if (room.participants.length < before) {
+          console.log("[webrtcSocket] pruned", before - room.participants.length, "stale participants from", roomKey);
+
+          // Also clean stale entries from agoraUidMappings
+          const roomMappings = agoraUidMappings.get(roomKey);
+          if (roomMappings) {
+            for (const mappedSid of roomMappings.keys()) {
+              if (!connectedSocketIds.has(mappedSid)) {
+                roomMappings.delete(mappedSid);
+              }
+            }
+            if (roomMappings.size === 0) agoraUidMappings.delete(roomKey);
+          }
+        }
+
         // upsert participant by socketId
         const existingIndex = room.participants.findIndex(
           (participant) => participant.socketId === socket.id,
@@ -125,14 +146,17 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
           ts: Date.now(),
         });
 
-        // If someone is already sharing, notify the new joiner
-        const currentSharer = activeSharers.get(roomKey);
-        if (currentSharer && currentSharer.socketId !== socket.id) {
-          socket.emit("screenshare:started", {
-            roomKey,
-            sharerSocketId: currentSharer.socketId,
-            sharerName: currentSharer.name,
-          });
+        // Replay existing Agora UID mappings to the newly joined socket
+        const roomMappings = agoraUidMappings.get(roomKey);
+        if (roomMappings && roomMappings.size > 0) {
+          for (const [mappedSocketId, mapping] of roomMappings) {
+            socket.emit("agora:uid-map", {
+              socketId: mappedSocketId,
+              agoraUid: mapping.agoraUid,
+              name: mapping.name,
+            });
+          }
+          console.log("[webrtcSocket] replayed", roomMappings.size, "UID mappings to", socket.id);
         }
       } catch (error) {
         console.log("[webrtcSocket] room:join error:", error);
@@ -149,46 +173,31 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
 
         socket.leave(roomKey);
 
-        const room = await Room.findOne({ roomKey });
-        if (!room) return;
-
-        const leavingParticipant = room.participants.find(
-          (participant) => participant.socketId === socket.id,
+        // Atomically remove participant to avoid VersionError
+        const room = await Room.findOneAndUpdate(
+          { roomKey },
+          { $pull: { participants: { socketId: socket.id } } },
+          { new: true },
         );
 
-        room.participants = room.participants.filter(
-          (participant) => participant.socketId !== socket.id,
-        );
-        await room.save();
+        if (room) {
+          io.to(roomKey).emit("room:participants", {
+            roomKey,
+            participants: room.participants,
+          });
 
-        io.to(roomKey).emit("room:participants", {
-          roomKey,
-          participants: room.participants,
-        });
-
-        if (leavingParticipant) {
           io.to(roomKey).emit("room:notice", {
             roomKey,
-            text: `${leavingParticipant.name} left the room`,
+            text: `${socket.user?.name || "Someone"} left the room`,
             ts: Date.now(),
           });
         }
 
-        // If the leaver was the screen sharer, clear and notify
-        const roomSharer = activeSharers.get(roomKey);
-        if (roomSharer?.socketId === socket.id) {
-          activeSharers.delete(roomKey);
-          io.to(roomKey).emit("screenshare:stopped", {
-            roomKey,
-            sharerSocketId: socket.id,
-          });
-        }
-
-        // Remove from camera-ready set
-        const camReady = cameraReadyUsers.get(roomKey);
-        if (camReady) {
-          camReady.delete(socket.id);
-          if (camReady.size === 0) cameraReadyUsers.delete(roomKey);
+        // Clean up Agora UID mapping for the departing socket
+        const roomMappings = agoraUidMappings.get(roomKey);
+        if (roomMappings) {
+          roomMappings.delete(socket.id);
+          if (roomMappings.size === 0) agoraUidMappings.delete(roomKey);
         }
       } catch (error) {
         console.log("[webrtcSocket] room:leave error:", error);
@@ -225,147 +234,32 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
       }
     });
 
-    // ── Screen share: start ───────────────────────────────
-    socket.on("screenshare:start", (payload) => {
-      const { roomKey } = payload || {};
-      if (!roomKey) return;
+    // ── Agora UID announce ───────────────────────────────
+    // When a user joins the Agora channel, they broadcast their
+    // Agora UID so others can map UID → participant name.
+    socket.on("agora:uid-announce", (payload) => {
+      const { roomKey, agoraUid } = payload || {};
+      if (!roomKey || agoraUid == null) return;
 
-      // Only one sharer at a time per room
-      const currentSharer = activeSharers.get(roomKey);
-      if (currentSharer && currentSharer.socketId !== socket.id) {
-        socket.emit("screenshare:denied", {
-          reason: "Someone is already sharing their screen.",
-        });
-        return;
-      }
+      const userName = socket.user?.name || "Unknown";
 
-      const sharerInfo = {
+      console.log("[webrtcSocket] agora:uid-announce", {
         socketId: socket.id,
-        name: socket.user?.name || "Unknown",
-      };
-      activeSharers.set(roomKey, sharerInfo);
-
-      console.log("[webrtcSocket] screenshare:start", { roomKey, sharer: socket.id });
-
-      // Broadcast to all OTHER users in the room
-      socket.to(roomKey).emit("screenshare:started", {
-        roomKey,
-        sharerSocketId: socket.id,
-        sharerName: socket.user?.name || "Unknown",
+        agoraUid,
+        name: userName,
       });
-    });
 
-    // ── Screen share: stop ────────────────────────────────
-    socket.on("screenshare:stop", (payload) => {
-      const { roomKey } = payload || {};
-      if (!roomKey) return;
-
-      const currentSharer = activeSharers.get(roomKey);
-      if (currentSharer?.socketId === socket.id) {
-        activeSharers.delete(roomKey);
+      // Store the mapping so late joiners can receive it
+      if (!agoraUidMappings.has(roomKey)) {
+        agoraUidMappings.set(roomKey, new Map());
       }
+      agoraUidMappings.get(roomKey).set(socket.id, { agoraUid, name: userName });
 
-      console.log("[webrtcSocket] screenshare:stop", { roomKey, sharer: socket.id });
-
-      io.to(roomKey).emit("screenshare:stopped", {
-        roomKey,
-        sharerSocketId: socket.id,
-      });
-    });
-
-    // ── WebRTC signaling relay (offer / answer / ICE) ─────
-    socket.on("signal:viewer-ready", (payload) => {
-      const { targetSocketId } = payload || {};
-      if (!targetSocketId) return;
-      io.to(targetSocketId).emit("signal:viewer-ready", {
-        viewerSocketId: socket.id,
-      });
-    });
-
-    socket.on("signal:offer", (payload) => {
-      const { targetSocketId, sdp } = payload || {};
-      if (!targetSocketId || !sdp) return;
-      io.to(targetSocketId).emit("signal:offer", {
-        senderSocketId: socket.id,
-        sdp,
-      });
-    });
-
-    socket.on("signal:answer", (payload) => {
-      const { targetSocketId, sdp } = payload || {};
-      if (!targetSocketId || !sdp) return;
-      io.to(targetSocketId).emit("signal:answer", {
-        senderSocketId: socket.id,
-        sdp,
-      });
-    });
-
-    socket.on("signal:ice-candidate", (payload) => {
-      const { targetSocketId, candidate } = payload || {};
-      if (!targetSocketId || !candidate) return;
-      io.to(targetSocketId).emit("signal:ice-candidate", {
-        senderSocketId: socket.id,
-        candidate,
-      });
-    });
-
-    // ── Camera mesh: readiness + signaling ──────────────
-    socket.on("camera:ready", ({ roomKey }) => {
-      if (!roomKey) return;
-
-      // Track this user as camera-ready
-      if (!cameraReadyUsers.has(roomKey)) {
-        cameraReadyUsers.set(roomKey, new Set());
-      }
-      cameraReadyUsers.get(roomKey).add(socket.id);
-
-      // Notify others in the room that this user is camera-ready
-      socket.to(roomKey).emit("camera:user-ready", { socketId: socket.id });
-
-      // Tell this user about all other camera-ready users in the room
-      const readySet = cameraReadyUsers.get(roomKey);
-      const otherReadyUsers = [...readySet].filter((id) => id !== socket.id);
-      if (otherReadyUsers.length > 0) {
-        socket.emit("camera:users-ready", { socketIds: otherReadyUsers });
-      }
-
-      console.log("[webrtcSocket] camera:ready", { roomKey, socketId: socket.id, totalReady: readySet.size });
-    });
-
-    socket.on("camera:offer", (payload) => {
-      const { targetSocketId, sdp } = payload || {};
-      if (!targetSocketId || !sdp) return;
-      io.to(targetSocketId).emit("camera:offer", {
-        senderSocketId: socket.id,
-        sdp,
-      });
-    });
-
-    socket.on("camera:answer", (payload) => {
-      const { targetSocketId, sdp } = payload || {};
-      if (!targetSocketId || !sdp) return;
-      io.to(targetSocketId).emit("camera:answer", {
-        senderSocketId: socket.id,
-        sdp,
-      });
-    });
-
-    socket.on("camera:ice-candidate", (payload) => {
-      const { targetSocketId, candidate } = payload || {};
-      if (!targetSocketId || !candidate) return;
-      io.to(targetSocketId).emit("camera:ice-candidate", {
-        senderSocketId: socket.id,
-        candidate,
-      });
-    });
-
-    // Relay camera on/off toggle to all others in the room
-    socket.on("camera:cam-toggled", (payload) => {
-      const { roomKey, camOn } = payload || {};
-      if (!roomKey) return;
-      socket.to(roomKey).emit("camera:cam-toggled", {
+      // Broadcast to everyone in the room (including sender for confirmation)
+      io.to(roomKey).emit("agora:uid-map", {
         socketId: socket.id,
-        camOn: !!camOn,
+        agoraUid,
+        name: userName,
       });
     });
 
@@ -374,53 +268,38 @@ export function initWebRTCSocketServer(httpServer, options = {}) {
       try {
         console.log("[webrtcSocket] disconnected:", socket.id);
 
-        // remove socket from any rooms where it exists
+        const userName = socket.user?.name || "Someone";
+
+        // Atomically remove this socket from ALL rooms it was in
         const roomsWithSocket = await Room.find({
           "participants.socketId": socket.id,
         });
 
-        for (const room of roomsWithSocket) {
-          const previousCount = room.participants.length;
-
-          const leavingParticipant = room.participants.find(
-            (participant) => participant.socketId === socket.id,
+        for (const roomDoc of roomsWithSocket) {
+          const updatedRoom = await Room.findOneAndUpdate(
+            { roomKey: roomDoc.roomKey },
+            { $pull: { participants: { socketId: socket.id } } },
+            { new: true },
           );
 
-          room.participants = room.participants.filter(
-            (participant) => participant.socketId !== socket.id,
-          );
-          await room.save();
-
-          if (previousCount !== room.participants.length) {
-            io.to(room.roomKey).emit("room:participants", {
-              roomKey: room.roomKey,
-              participants: room.participants,
+          if (updatedRoom) {
+            io.to(roomDoc.roomKey).emit("room:participants", {
+              roomKey: roomDoc.roomKey,
+              participants: updatedRoom.participants,
             });
 
-            if (leavingParticipant) {
-              io.to(room.roomKey).emit("room:notice", {
-                roomKey: room.roomKey,
-                text: `${leavingParticipant.name} disconnected`,
-                ts: Date.now(),
-              });
-            }
+            io.to(roomDoc.roomKey).emit("room:notice", {
+              roomKey: roomDoc.roomKey,
+              text: `${userName} disconnected`,
+              ts: Date.now(),
+            });
+          }
 
-            // If the disconnected user was the sharer, clear and notify
-            const disconnectedSharer = activeSharers.get(room.roomKey);
-            if (disconnectedSharer?.socketId === socket.id) {
-              activeSharers.delete(room.roomKey);
-              io.to(room.roomKey).emit("screenshare:stopped", {
-                roomKey: room.roomKey,
-                sharerSocketId: socket.id,
-              });
-            }
-
-            // Remove from camera-ready set
-            const camReady = cameraReadyUsers.get(room.roomKey);
-            if (camReady) {
-              camReady.delete(socket.id);
-              if (camReady.size === 0) cameraReadyUsers.delete(room.roomKey);
-            }
+          // Clean up Agora UID mapping for the disconnected socket
+          const roomMappings = agoraUidMappings.get(roomDoc.roomKey);
+          if (roomMappings) {
+            roomMappings.delete(socket.id);
+            if (roomMappings.size === 0) agoraUidMappings.delete(roomDoc.roomKey);
           }
         }
       } catch (error) {

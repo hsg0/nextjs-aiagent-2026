@@ -11,6 +11,7 @@ import authRouter from "./routes/auth/authRoutes.js";
 import googleGeminiAiRouter from "./routes/googleGeminiAi/googleGeminiAiRoutes.js";
 import webrtcRoomRoutes from "./routes/webrtcroutes/roomRoutes.js";
 import webrtcMessageRoutes from "./routes/webrtcroutes/messageRoutes.js";
+import agoraTokenRoutes from "./routes/webrtcroutes/agoraTokenRoutes.js";
 
 dotenv.config();
 
@@ -63,6 +64,9 @@ app.use('/api/v1/google-gemini-ai', googleGeminiAiRouter);
 // webrtc room + message REST routes
 app.use('/webrtc/rooms', webrtcRoomRoutes);
 app.use('/webrtc/messages', webrtcMessageRoutes);
+
+// agora token route
+app.use('/api/v1/agora', agoraTokenRoutes);
 
 // AI socket (default path /socket.io)
 createSocketServer(httpServer, allowedOrigins);

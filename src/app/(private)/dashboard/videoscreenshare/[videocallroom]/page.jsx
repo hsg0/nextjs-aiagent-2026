@@ -7,14 +7,11 @@ import axios from "axios";
 import { useUser } from "../../../../../context/UserContext";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4040";
-
-const ICE_SERVERS = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-];
+const AGORA_APP_ID = process.env.NEXT_PUBLIC_AGORA_APP_ID || "";
+const SCREEN_SHARE_UID_OFFSET = 100000;
 
 // ─────────────────────────────────────────────────────────────
-// Video Call Room Page (Majubee Theme)
+// Video Call Room Page (Majubee Theme) — Agora SDK
 // ─────────────────────────────────────────────────────────────
 export default function VideoCallRoomPage() {
   return (
@@ -43,37 +40,34 @@ function VideoCallRoomInner() {
   );
   const email = user?.email || "";
 
-  // ── Streams / previews ──────────────────────────────────
-  const camVideoRef = useRef(null); // self circle video
-  const stageVideoRef = useRef(null); // stage video when pinned
-  const audioStreamRef = useRef(null);
-  const camStreamRef = useRef(null);
+  // ── Agora refs ────────────────────────────────────────────
+  const AgoraRTCRef = useRef(null);
+  const agoraClientRef = useRef(null);
+  const screenClientRef = useRef(null);
+  const localAudioTrackRef = useRef(null);
+  const localVideoTrackRef = useRef(null);
+  const localScreenTrackRef = useRef(null);
+  const agoraJoinedRef = useRef(false);
 
-  // ── Screen share refs ─────────────────────────────────
-  const screenStreamRef = useRef(null); // local screen share MediaStream
-  const screenVideoRef = useRef(null); // <video> for local screen on stage
-  const peerConnectionsRef = useRef({}); // { socketId: RTCPeerConnection }
-  const remoteScreenVideoRef = useRef(null); // <video> for remote screen on stage
+  // ── Agora state ───────────────────────────────────────────
+  const [myAgoraUid, setMyAgoraUid] = useState(0);
+  const [remoteUsers, setRemoteUsers] = useState({}); // { [uid]: { videoTrack, audioTrack, hasVideo, hasAudio } }
+  const [uidMap, setUidMap] = useState({}); // { [agoraUid]: { socketId, name } }
+  const [remoteScreenShare, setRemoteScreenShare] = useState(null); // { uid, videoTrack, audioTrack } or null
+  const [localTracksReady, setLocalTracksReady] = useState(false);
 
+  // ── Media status ─────────────────────────────────────────
   const [audioStatus, setAudioStatus] = useState("idle"); // idle | loading | ready | denied | error
-  const [camStatus, setCamStatus] = useState("idle"); // idle | loading | ready | denied | error
+  const [camStatus, setCamStatus] = useState("idle");
   const [notice, setNotice] = useState("");
 
-  // ── Screen share state ────────────────────────────────
-  const [shareOn, setShareOn] = useState(false); // am I currently sharing my screen?
-  const [remoteSharer, setRemoteSharer] = useState(null); // { socketId, name } or null
-  const [remoteScreenStream, setRemoteScreenStream] = useState(null); // remote MediaStream
+  // ── Screen share state ───────────────────────────────────
+  const [shareOn, setShareOn] = useState(false);
 
-  // ── Camera mesh (multi-participant) ───────────────────
-  const cameraPeersRef = useRef({}); // { remoteSocketId: RTCPeerConnection }
-  const remoteCameraReadyRef = useRef(new Set()); // remote users that emitted camera:ready
-  const mediaFlowCompleteRef = useRef(false); // true once local permission flow finishes
-  const cameraReadyEmittedRef = useRef(false); // true once we emitted camera:ready
-  const [remoteStreams, setRemoteStreams] = useState({}); // { remoteSocketId: MediaStream }
-  const [remoteCamStatus, setRemoteCamStatus] = useState({}); // { remoteSocketId: boolean }
-
-  // ── Stage / fullscreen / pin ────────────────────────────
+  // ── Stage / fullscreen / pin ─────────────────────────────
   const stageWrapRef = useRef(null);
+  const selfVideoContainerRef = useRef(null);
+  const stageVideoContainerRef = useRef(null);
   const [isStageFullscreen, setIsStageFullscreen] = useState(false);
   const [pinnedToStage, setPinnedToStage] = useState(null); // null | "self" | remoteSocketId
 
@@ -82,10 +76,10 @@ function VideoCallRoomInner() {
   const [socketConnected, setSocketConnected] = useState(false);
   const [mySocketId, setMySocketId] = useState("");
 
-  // ── Participants (driven by socket) ─────────────────────
+  // ── Participants (driven by socket) ──────────────────────
   const [participants, setParticipants] = useState([]);
 
-  // ── Chat (driven by socket) ─────────────────────────────
+  // ── Chat (driven by socket) ──────────────────────────────
   const [messages, setMessages] = useState([]);
   const [chatText, setChatText] = useState("");
   const chatEndRef = useRef(null);
@@ -94,81 +88,48 @@ function VideoCallRoomInner() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length]);
 
-  // ── Helper: create a camera peer connection for a remote user ──
-  function createCameraPeer(remoteSocketId) {
-    if (cameraPeersRef.current[remoteSocketId]) {
-      return cameraPeersRef.current[remoteSocketId];
-    }
+  // ── Controls ─────────────────────────────────────────────
+  const [micOn, setMicOn] = useState(true);
+  const [camOn, setCamOn] = useState(true);
 
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    cameraPeersRef.current[remoteSocketId] = pc;
+  // ── Initials for avatar fallback ─────────────────────────
+  const initials = useMemo(() => {
+    const nameString = (displayName || email || "U").trim();
+    const parts = nameString.split(/\s+/).filter(Boolean);
+    const firstInitial = parts[0]?.[0] || "U";
+    const lastInitial = parts.length > 1 ? parts[1]?.[0] : "";
+    return (firstInitial + lastInitial).toUpperCase();
+  }, [displayName, email]);
 
-    // Add local camera + audio tracks (if available)
-    if (camStreamRef.current) {
-      camStreamRef.current.getTracks().forEach((t) => pc.addTrack(t, camStreamRef.current));
-    }
-    if (audioStreamRef.current) {
-      audioStreamRef.current.getTracks().forEach((t) => pc.addTrack(t, audioStreamRef.current));
-    }
+  const go = (path) => router.push(path);
 
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate) {
-        socketRef.current?.emit("camera:ice-candidate", {
-          targetSocketId: remoteSocketId,
-          candidate: ev.candidate,
-        });
+  // ── Helper: find Agora UID for a socket ID ───────────────
+  const getAgoraUidForSocket = useCallback(
+    (socketId) => {
+      for (const [uid, info] of Object.entries(uidMap)) {
+        if (info.socketId === socketId) return Number(uid);
       }
-    };
+      return null;
+    },
+    [uidMap],
+  );
 
-    pc.ontrack = (ev) => {
-      console.log("[videocallroom] camera ontrack from", remoteSocketId);
-      const [stream] = ev.streams;
-      if (stream) {
-        setRemoteStreams((prev) => ({ ...prev, [remoteSocketId]: stream }));
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed") {
-        console.log("[videocallroom] camera peer failed:", remoteSocketId);
-        pc.close();
-        delete cameraPeersRef.current[remoteSocketId];
-        setRemoteStreams((prev) => {
-          const next = { ...prev };
-          delete next[remoteSocketId];
-          return next;
-        });
-      }
-    };
-
-    return pc;
-  }
-
-  function cleanupAllCameraPeers() {
-    Object.values(cameraPeersRef.current).forEach((pc) => pc.close());
-    cameraPeersRef.current = {};
-    remoteCameraReadyRef.current.clear();
-    setRemoteStreams({});
-  }
-
-  // ── Connect to WebRTC socket + join room + fetch history ─
+  // ────────────────────────────────────────────────────────
+  // Effect 1: Socket connection + room lifecycle + chat
+  // ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!room || !displayName) return;
 
-    // 1) Connect to the webrtc socket on the separate path
     const socket = socketIOClient(API_BASE, {
       path: "/socket.io-webrtc",
       withCredentials: true,
     });
-
     socketRef.current = socket;
 
     socket.on("connect", () => {
       console.log("[videocallroom] socket connected:", socket.id);
       setSocketConnected(true);
       setMySocketId(socket.id);
-
-      // 2) Join the room
       socket.emit("room:join", {
         roomKey: room,
         userId: user?._id || "",
@@ -182,48 +143,32 @@ function VideoCallRoomInner() {
       setSocketConnected(false);
     });
 
-    // 3) Listen for participant updates
+    // Participant updates
     socket.on("room:participants", (payload) => {
       console.log("[videocallroom] room:participants", payload?.participants?.length);
-      const participantList = (payload?.participants || []).map((participant) => ({
-        id: participant.socketId || participant.userId || participant.name,
-        name: participant.name,
-        email: participant.email || "",
+      const participantList = (payload?.participants || []).map((p) => ({
+        id: p.socketId || p.userId || p.name,
+        name: p.name,
+        email: p.email || "",
         online: true,
       }));
       setParticipants(participantList);
 
-      // Cleanup camera peers for participants that have left
+      // Unpin if the participant left
       const currentIds = new Set(participantList.map((p) => p.id));
-      for (const remoteId of Object.keys(cameraPeersRef.current)) {
-        if (!currentIds.has(remoteId)) {
-          cameraPeersRef.current[remoteId]?.close();
-          delete cameraPeersRef.current[remoteId];
-          remoteCameraReadyRef.current.delete(remoteId);
-          setRemoteStreams((prev) => {
-            const next = { ...prev };
-            delete next[remoteId];
-            return next;
-          });
-          setRemoteCamStatus((prev) => {
-            const next = { ...prev };
-            delete next[remoteId];
-            return next;
-          });
-          // Auto-unpin if the departed participant was pinned
-          setPinnedToStage((prev) => (prev === remoteId ? null : prev));
-        }
-      }
+      setPinnedToStage((prev) => {
+        if (prev && prev !== "self" && !currentIds.has(prev)) return null;
+        return prev;
+      });
     });
 
-    // 4) Listen for chat messages (deduplicate by id)
+    // Chat messages (deduplicate by id)
     socket.on("chat:new", (incoming) => {
       const incomingId = incoming.id || `m-${Date.now()}-${Math.random()}`;
-      console.log("[videocallroom] chat:new", incoming?.name, incoming?.text);
-      setMessages((previous) => {
-        if (previous.some((existing) => existing.id === incomingId)) return previous;
+      setMessages((prev) => {
+        if (prev.some((e) => e.id === incomingId)) return prev;
         return [
-          ...previous,
+          ...prev,
           {
             id: incomingId,
             who: incoming.email === email ? "me" : "user",
@@ -235,12 +180,11 @@ function VideoCallRoomInner() {
       });
     });
 
-    // 5) Listen for room notices (join/leave/disconnect)
+    // Room notices (join/leave/disconnect)
     socket.on("room:notice", (payload) => {
       const noticeId = `notice-${payload?.ts || Date.now()}-${Math.random()}`;
-      console.log("[videocallroom] room:notice:", payload?.text);
-      setMessages((previous) => [
-        ...previous,
+      setMessages((prev) => [
+        ...prev,
         {
           id: noticeId,
           who: "bot",
@@ -251,242 +195,13 @@ function VideoCallRoomInner() {
       ]);
     });
 
-    // ── Screen share signaling listeners ──────────────────
-
-    // Someone started sharing (or we just joined and there's an active sharer)
-    socket.on("screenshare:started", ({ sharerSocketId, sharerName }) => {
-      if (sharerSocketId === socket.id) return; // I'm the sharer, ignore
-      console.log("[videocallroom] screenshare:started by", sharerName);
-      setRemoteSharer({ socketId: sharerSocketId, name: sharerName });
-      // Tell the sharer we want the stream
-      socket.emit("signal:viewer-ready", { targetSocketId: sharerSocketId });
+    // Agora UID mapping from other users
+    socket.on("agora:uid-map", ({ socketId, agoraUid, name }) => {
+      console.log("[videocallroom] agora:uid-map", { socketId, agoraUid, name });
+      setUidMap((prev) => ({ ...prev, [agoraUid]: { socketId, name } }));
     });
 
-    // Screen share stopped
-    socket.on("screenshare:stopped", () => {
-      console.log("[videocallroom] screenshare:stopped");
-      setRemoteSharer(null);
-      setRemoteScreenStream(null);
-      // Close any viewer-side peer connections
-      Object.values(peerConnectionsRef.current).forEach((pc) => pc.close());
-      peerConnectionsRef.current = {};
-      if (remoteScreenVideoRef.current) {
-        remoteScreenVideoRef.current.srcObject = null;
-      }
-    });
-
-    // Server denied our share request (someone else is sharing)
-    socket.on("screenshare:denied", ({ reason }) => {
-      console.log("[videocallroom] screenshare:denied:", reason);
-      setNotice(reason || "Cannot share right now.");
-      setShareOn(false);
-      // Stop local screen tracks if we started them
-      if (screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach((t) => t.stop());
-        screenStreamRef.current = null;
-      }
-      setTimeout(() => setNotice(""), 3000);
-    });
-
-    // [SHARER] A viewer is ready to receive our stream
-    socket.on("signal:viewer-ready", async ({ viewerSocketId }) => {
-      if (!screenStreamRef.current) return;
-      console.log("[videocallroom] viewer-ready from", viewerSocketId);
-      try {
-        const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-        peerConnectionsRef.current[viewerSocketId] = pc;
-
-        // Add screen tracks to the connection
-        screenStreamRef.current.getTracks().forEach((track) => {
-          pc.addTrack(track, screenStreamRef.current);
-        });
-
-        pc.onicecandidate = (event) => {
-          if (event.candidate) {
-            socket.emit("signal:ice-candidate", {
-              targetSocketId: viewerSocketId,
-              candidate: event.candidate,
-            });
-          }
-        };
-
-        pc.onconnectionstatechange = () => {
-          if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-            pc.close();
-            delete peerConnectionsRef.current[viewerSocketId];
-          }
-        };
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-
-        socket.emit("signal:offer", {
-          targetSocketId: viewerSocketId,
-          sdp: pc.localDescription,
-        });
-      } catch (err) {
-        console.log("[videocallroom] error creating offer for viewer:", err);
-      }
-    });
-
-    // [VIEWER] Received an offer from the sharer
-    socket.on("signal:offer", async ({ senderSocketId, sdp }) => {
-      console.log("[videocallroom] signal:offer from", senderSocketId);
-      try {
-        const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-        peerConnectionsRef.current[senderSocketId] = pc;
-
-        pc.onicecandidate = (event) => {
-          if (event.candidate) {
-            socket.emit("signal:ice-candidate", {
-              targetSocketId: senderSocketId,
-              candidate: event.candidate,
-            });
-          }
-        };
-
-        pc.ontrack = (event) => {
-          console.log("[videocallroom] ontrack — remote screen stream received");
-          const [remoteStream] = event.streams;
-          if (remoteStream) {
-            setRemoteScreenStream(remoteStream);
-            // Try to attach immediately if video element exists
-            if (remoteScreenVideoRef.current) {
-              remoteScreenVideoRef.current.srcObject = remoteStream;
-              remoteScreenVideoRef.current.play().catch(() => {});
-            }
-          }
-        };
-
-        pc.onconnectionstatechange = () => {
-          if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-            pc.close();
-            delete peerConnectionsRef.current[senderSocketId];
-          }
-        };
-
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-
-        socket.emit("signal:answer", {
-          targetSocketId: senderSocketId,
-          sdp: pc.localDescription,
-        });
-      } catch (err) {
-        console.log("[videocallroom] error handling offer:", err);
-      }
-    });
-
-    // [SHARER] Received an answer from a viewer
-    socket.on("signal:answer", async ({ senderSocketId, sdp }) => {
-      console.log("[videocallroom] signal:answer from", senderSocketId);
-      const pc = peerConnectionsRef.current[senderSocketId];
-      if (!pc) return;
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      } catch (err) {
-        console.log("[videocallroom] error setting answer:", err);
-      }
-    });
-
-    // [BOTH] Received an ICE candidate
-    socket.on("signal:ice-candidate", async ({ senderSocketId, candidate }) => {
-      const pc = peerConnectionsRef.current[senderSocketId];
-      if (!pc) return;
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (err) {
-        console.log("[videocallroom] error adding ICE candidate:", err);
-      }
-    });
-
-    // ── Camera mesh signaling listeners ───────────────────
-
-    // Another user's camera is ready — maybe initiate a connection
-    socket.on("camera:user-ready", ({ socketId: remoteId }) => {
-      console.log("[videocallroom] camera:user-ready from", remoteId);
-      remoteCameraReadyRef.current.add(remoteId);
-
-      // If my media is ready AND I have the lower ID → I create the offer
-      if (mediaFlowCompleteRef.current && socket.id < remoteId && !cameraPeersRef.current[remoteId]) {
-        (async () => {
-          try {
-            const pc = createCameraPeer(remoteId);
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit("camera:offer", { targetSocketId: remoteId, sdp: pc.localDescription });
-          } catch (err) {
-            console.log("[videocallroom] camera offer error:", err);
-          }
-        })();
-      }
-    });
-
-    // Server tells us about all currently-ready users when WE emit camera:ready
-    socket.on("camera:users-ready", ({ socketIds }) => {
-      console.log("[videocallroom] camera:users-ready", socketIds?.length);
-      for (const remoteId of socketIds || []) {
-        remoteCameraReadyRef.current.add(remoteId);
-        if (mediaFlowCompleteRef.current && socket.id < remoteId && !cameraPeersRef.current[remoteId]) {
-          (async () => {
-            try {
-              const pc = createCameraPeer(remoteId);
-              const offer = await pc.createOffer();
-              await pc.setLocalDescription(offer);
-              socket.emit("camera:offer", { targetSocketId: remoteId, sdp: pc.localDescription });
-            } catch (err) {
-              console.log("[videocallroom] camera offer error (users-ready):", err);
-            }
-          })();
-        }
-      }
-    });
-
-    // Received an offer for camera mesh from another user
-    socket.on("camera:offer", async ({ senderSocketId, sdp }) => {
-      console.log("[videocallroom] camera:offer from", senderSocketId);
-      try {
-        const pc = createCameraPeer(senderSocketId);
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit("camera:answer", { targetSocketId: senderSocketId, sdp: pc.localDescription });
-      } catch (err) {
-        console.log("[videocallroom] camera answer error:", err);
-      }
-    });
-
-    // Received an answer for camera mesh
-    socket.on("camera:answer", async ({ senderSocketId, sdp }) => {
-      console.log("[videocallroom] camera:answer from", senderSocketId);
-      const pc = cameraPeersRef.current[senderSocketId];
-      if (!pc) return;
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      } catch (err) {
-        console.log("[videocallroom] camera set-answer error:", err);
-      }
-    });
-
-    // ICE candidate for camera mesh
-    socket.on("camera:ice-candidate", async ({ senderSocketId, candidate }) => {
-      const pc = cameraPeersRef.current[senderSocketId];
-      if (!pc) return;
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (err) {
-        console.log("[videocallroom] camera ICE error:", err);
-      }
-    });
-
-    // Remote user toggled their camera on/off
-    socket.on("camera:cam-toggled", ({ socketId, camOn }) => {
-      console.log("[videocallroom] camera:cam-toggled", socketId, camOn);
-      setRemoteCamStatus((prev) => ({ ...prev, [socketId]: camOn }));
-    });
-
-    // 6) Fetch message history via REST (deduplicate against already-received socket messages)
+    // Fetch message history via REST
     axios
       .get(`${API_BASE}/webrtc/messages/${encodeURIComponent(room)}?limit=100`, {
         withCredentials: true,
@@ -501,31 +216,18 @@ function VideoCallRoomInner() {
             text: msg.text || "",
             ts: msg.createdAt ? new Date(msg.createdAt).getTime() : Date.now(),
           }));
-          setMessages((previous) => {
-            const existingIds = new Set(previous.map((existing) => existing.id));
-            const uniqueHistory = mapped.filter((msg) => !existingIds.has(msg.id));
-            return [...uniqueHistory, ...previous];
+          setMessages((prev) => {
+            const existingIds = new Set(prev.map((e) => e.id));
+            const unique = mapped.filter((m) => !existingIds.has(m.id));
+            return [...unique, ...prev];
           });
         }
       })
-      .catch((error) => {
-        console.log("[videocallroom] fetch history error:", error?.message);
-      });
+      .catch((err) => console.log("[videocallroom] fetch history error:", err?.message));
 
-    // 7) Cleanup on unmount
+    // Cleanup on unmount
     return () => {
       console.log("[videocallroom] socket cleanup");
-      // Stop local screen share if active
-      if (screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach((t) => t.stop());
-        screenStreamRef.current = null;
-      }
-      // Close all screen share peer connections
-      Object.values(peerConnectionsRef.current).forEach((pc) => pc.close());
-      peerConnectionsRef.current = {};
-      // Close all camera mesh peer connections
-      cleanupAllCameraPeers();
-
       socket.emit("room:leave", { roomKey: room });
       socket.disconnect();
       socketRef.current = null;
@@ -533,214 +235,308 @@ function VideoCallRoomInner() {
     };
   }, [room, displayName, email, user?._id]);
 
-  // ── Initials for avatar fallback ────────────────────────
-  const initials = useMemo(() => {
-    const nameString = (displayName || email || "U").trim();
-    const parts = nameString.split(/\s+/).filter(Boolean);
-    const firstInitial = parts[0]?.[0] || "U";
-    const lastInitial = parts.length > 1 ? parts[1]?.[0] : "";
-    return (firstInitial + lastInitial).toUpperCase();
-  }, [displayName, email]);
-
-  // ── Navigation ──────────────────────────────────────────
-  const go = (path) => {
-    console.log("[videocallroom] navigating to:", path);
-    router.push(path);
-  };
-
   // ────────────────────────────────────────────────────────
-  // Permission flow:
-  //   1) after 1s -> request mic (audio)
-  //   2) after that completes -> wait 1s -> request camera (video)
-  // This makes the browser show prompts sequentially.
+  // Effect 2: Agora connection + local tracks
   // ────────────────────────────────────────────────────────
   useEffect(() => {
+    if (!socketConnected || !room || !mySocketId) return;
+
     let cancelled = false;
 
-    async function requestMicThenCam() {
-      if (typeof window === "undefined") return;
-
-      const mediaDevices = navigator?.mediaDevices;
-      if (!mediaDevices?.getUserMedia) {
-        setAudioStatus("error");
-        setCamStatus("error");
-        setNotice("Camera/mic not supported in this browser.");
-        return;
-      }
-
-      // 1) Mic prompt (after 1 sec)
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      if (cancelled) return;
-
+    async function initAgora() {
       try {
-        console.log("[videocallroom] requesting MIC permission...");
+        const AgoraRTC = (await import("agora-rtc-sdk-ng")).default;
+        AgoraRTCRef.current = AgoraRTC;
+
+        // Suppress Agora SDK console noise
+        AgoraRTC.setLogLevel(3); // WARNING level
+
+        if (cancelled) return;
+
+        // Generate a random UID (1-99999)
+        const uid = Math.floor(Math.random() * 99999) + 1;
+
+        // Fetch token from backend
+        const tokenRes = await axios.get(
+          `${API_BASE}/api/v1/agora/token?channel=${encodeURIComponent(room)}&uid=${uid}`,
+          { withCredentials: true },
+        );
+
+        if (cancelled) return;
+        const { token } = tokenRes.data;
+
+        // Create Agora client
+        const client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+        agoraClientRef.current = client;
+
+        // ── Remote user event handlers ──
+        client.on("user-published", async (remoteUser, mediaType) => {
+          const remoteUid = remoteUser.uid;
+          console.log("[agora] user-published", remoteUid, mediaType);
+
+          // Screen share user (UID >= offset)
+          if (remoteUid >= SCREEN_SHARE_UID_OFFSET) {
+            await client.subscribe(remoteUser, mediaType);
+            setRemoteScreenShare((prev) => ({
+              uid: remoteUid,
+              videoTrack: mediaType === "video" ? remoteUser.videoTrack : (prev?.videoTrack || null),
+              audioTrack: mediaType === "audio" ? remoteUser.audioTrack : (prev?.audioTrack || null),
+            }));
+            if (mediaType === "audio" && remoteUser.audioTrack) {
+              remoteUser.audioTrack.play();
+            }
+            return;
+          }
+
+          // Normal user
+          await client.subscribe(remoteUser, mediaType);
+          setRemoteUsers((prev) => ({
+            ...prev,
+            [remoteUid]: {
+              ...prev[remoteUid],
+              videoTrack: mediaType === "video" ? remoteUser.videoTrack : (prev[remoteUid]?.videoTrack || null),
+              audioTrack: mediaType === "audio" ? remoteUser.audioTrack : (prev[remoteUid]?.audioTrack || null),
+              hasVideo: mediaType === "video" ? true : (prev[remoteUid]?.hasVideo || false),
+              hasAudio: mediaType === "audio" ? true : (prev[remoteUid]?.hasAudio || false),
+            },
+          }));
+          if (mediaType === "audio" && remoteUser.audioTrack) {
+            remoteUser.audioTrack.play();
+          }
+        });
+
+        client.on("user-unpublished", (remoteUser, mediaType) => {
+          const remoteUid = remoteUser.uid;
+          console.log("[agora] user-unpublished", remoteUid, mediaType);
+
+          if (remoteUid >= SCREEN_SHARE_UID_OFFSET) {
+            if (mediaType === "video") {
+              setRemoteScreenShare((prev) =>
+                prev?.uid === remoteUid ? { ...prev, videoTrack: null } : prev,
+              );
+            }
+            return;
+          }
+
+          setRemoteUsers((prev) => {
+            const existing = prev[remoteUid];
+            if (!existing) return prev;
+            return {
+              ...prev,
+              [remoteUid]: {
+                ...existing,
+                videoTrack: mediaType === "video" ? null : existing.videoTrack,
+                audioTrack: mediaType === "audio" ? null : existing.audioTrack,
+                hasVideo: mediaType === "video" ? false : existing.hasVideo,
+                hasAudio: mediaType === "audio" ? false : existing.hasAudio,
+              },
+            };
+          });
+        });
+
+        client.on("user-left", (remoteUser) => {
+          const remoteUid = remoteUser.uid;
+          console.log("[agora] user-left", remoteUid);
+
+          if (remoteUid >= SCREEN_SHARE_UID_OFFSET) {
+            setRemoteScreenShare((prev) =>
+              prev?.uid === remoteUid ? null : prev,
+            );
+            return;
+          }
+
+          setRemoteUsers((prev) => {
+            const next = { ...prev };
+            delete next[remoteUid];
+            return next;
+          });
+          setUidMap((prev) => {
+            const next = { ...prev };
+            delete next[remoteUid];
+            return next;
+          });
+        });
+
+        // Join the Agora channel
+        await client.join(AGORA_APP_ID, room, token, uid);
+        if (cancelled) {
+          await client.leave();
+          return;
+        }
+
+        agoraJoinedRef.current = true;
+        setMyAgoraUid(uid);
+        console.log("[agora] joined channel:", room, "uid:", uid);
+
+        // Announce our UID via socket
+        socketRef.current?.emit("agora:uid-announce", { roomKey: room, agoraUid: uid });
+
+        // Create local tracks (mic + camera separately for better error handling)
         setAudioStatus("loading");
-        setNotice("Requesting microphone permission...");
-
-        const audioStream = await mediaDevices.getUserMedia({
-          audio: true,
-          video: false,
-        });
-
-        if (cancelled) {
-          audioStream.getTracks().forEach((track) => track.stop());
-          return;
-        }
-
-        audioStreamRef.current = audioStream;
-        setAudioStatus("ready");
-        console.log("[videocallroom] mic ready");
-        setNotice("Microphone allowed. Now requesting camera...");
-      } catch (error) {
-        console.log("[videocallroom] mic permission error:", error);
-        const errorName = error?.name || "";
-        if (
-          errorName === "NotAllowedError" ||
-          errorName === "PermissionDeniedError"
-        ) {
-          setAudioStatus("denied");
-          setNotice("Microphone permission denied. Allow mic + refresh.");
-        } else {
-          setAudioStatus("error");
-          setNotice("Could not access microphone. Check browser settings.");
-        }
-        if (!cancelled) mediaFlowCompleteRef.current = true;
-        return; // stop here (don't request camera if mic denied)
-      }
-
-      // 2) Camera prompt (after 1 sec)
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      if (cancelled) return;
-
-      try {
-        console.log("[videocallroom] requesting CAMERA permission...");
         setCamStatus("loading");
+        setNotice("Requesting microphone and camera...");
 
-        const camStream = await mediaDevices.getUserMedia({
-          video: { facingMode: "user" },
-          audio: false,
-        });
+        const tracksToPublish = [];
+
+        // 1) Microphone
+        try {
+          const audioTrack = await AgoraRTC.createMicrophoneAudioTrack();
+          if (cancelled) { audioTrack.close(); return; }
+          localAudioTrackRef.current = audioTrack;
+          setAudioStatus("ready");
+          tracksToPublish.push(audioTrack);
+        } catch (micErr) {
+          console.log("[agora] mic error:", micErr?.message);
+          setAudioStatus("denied");
+        }
+
+        // 2) Camera
+        try {
+          const videoTrack = await AgoraRTC.createCameraVideoTrack();
+          if (cancelled) { videoTrack.close(); return; }
+          localVideoTrackRef.current = videoTrack;
+          setCamStatus("ready");
+          tracksToPublish.push(videoTrack);
+        } catch (camErr) {
+          console.log("[agora] cam error:", camErr?.message);
+          setCamStatus("denied");
+        }
 
         if (cancelled) {
-          camStream.getTracks().forEach((track) => track.stop());
+          tracksToPublish.forEach((t) => t.close());
           return;
         }
 
-        camStreamRef.current = camStream;
-        setCamStatus("ready");
-        setNotice("");
-
-        console.log("[videocallroom] camera ready");
-      } catch (error) {
-        console.log("[videocallroom] camera permission error:", error);
-        const errorName = error?.name || "";
-        if (
-          errorName === "NotAllowedError" ||
-          errorName === "PermissionDeniedError"
-        ) {
-          setCamStatus("denied");
-          setNotice("Camera permission denied. Allow camera + refresh.");
-        } else {
-          setCamStatus("error");
-          setNotice("Could not access camera. Check browser settings.");
+        // Publish whatever tracks succeeded
+        if (tracksToPublish.length > 0) {
+          await client.publish(tracksToPublish);
+          console.log("[agora] published", tracksToPublish.length, "local tracks");
         }
-      }
 
-      // Mark media flow as complete regardless of outcome
-      if (!cancelled) mediaFlowCompleteRef.current = true;
+        setLocalTracksReady(true);
+        setNotice(
+          tracksToPublish.length === 2
+            ? ""
+            : tracksToPublish.length === 1
+              ? "Camera or mic not available. Partial media."
+              : "Mic/camera not available.",
+        );
+      } catch (error) {
+        console.log("[agora] init error:", error);
+        setNotice("Failed to connect to video service. Check your connection.");
+      }
     }
 
-    requestMicThenCam();
+    initAgora();
 
     return () => {
       cancelled = true;
 
-      if (audioStreamRef.current) {
-        console.log("[videocallroom] stopping audio tracks...");
-        audioStreamRef.current.getTracks().forEach((track) => track.stop());
-        audioStreamRef.current = null;
+      // Close local tracks
+      if (localAudioTrackRef.current) {
+        localAudioTrackRef.current.close();
+        localAudioTrackRef.current = null;
+      }
+      if (localVideoTrackRef.current) {
+        localVideoTrackRef.current.close();
+        localVideoTrackRef.current = null;
+      }
+      if (localScreenTrackRef.current) {
+        localScreenTrackRef.current.close();
+        localScreenTrackRef.current = null;
       }
 
-      if (camStreamRef.current) {
-        console.log("[videocallroom] stopping camera tracks...");
-        camStreamRef.current.getTracks().forEach((track) => track.stop());
-        camStreamRef.current = null;
+      // Leave screen share client
+      if (screenClientRef.current) {
+        screenClientRef.current.leave().catch(() => {});
+        screenClientRef.current = null;
       }
+
+      // Leave main client
+      if (agoraClientRef.current) {
+        agoraClientRef.current.leave().catch(() => {});
+        agoraClientRef.current = null;
+      }
+
+      agoraJoinedRef.current = false;
+      setLocalTracksReady(false);
+      setRemoteUsers({});
+      setRemoteScreenShare(null);
     };
-  }, []);
+  }, [socketConnected, room, mySocketId]);
 
-  // Attach camera stream to the circle + stage video if pinned
+  // ────────────────────────────────────────────────────────
+  // Effect 3: Play local video in self circle or stage
+  // ────────────────────────────────────────────────────────
   useEffect(() => {
-    if (camStatus !== "ready" || !camStreamRef.current) return;
+    const track = localVideoTrackRef.current;
+    if (!track || !localTracksReady) return;
 
-    // Circle video
-    if (camVideoRef.current) {
-      camVideoRef.current.srcObject = camStreamRef.current;
-      camVideoRef.current.play().catch(() => {});
+    if (!camOn) {
+      track.stop();
+      return;
     }
 
-    // Stage video if self is pinned
-    if (pinnedToStage === "self" && stageVideoRef.current) {
-      stageVideoRef.current.srcObject = camStreamRef.current;
-      stageVideoRef.current.play().catch(() => {});
+    const isScreenShareActive = shareOn || !!remoteScreenShare;
+    const shouldPlayOnStage = pinnedToStage === "self" && !isScreenShareActive;
+
+    if (shouldPlayOnStage) {
+      const stageEl = stageVideoContainerRef.current;
+      if (stageEl) track.play(stageEl, { mirror: true });
+    } else {
+      const circleEl = selfVideoContainerRef.current;
+      if (circleEl) track.play(circleEl, { mirror: true });
     }
-  }, [camStatus, pinnedToStage]);
+  }, [localTracksReady, camOn, pinnedToStage, shareOn, remoteScreenShare]);
 
-  // ── Attach remote stream to stage when a remote user is pinned ─
+  // ────────────────────────────────────────────────────────
+  // Effect 4: Play stage content (screen share or pinned remote)
+  // ────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!pinnedToStage || pinnedToStage === "self") return;
-    const stream = remoteStreams[pinnedToStage];
-    if (stageVideoRef.current && stream) {
-      stageVideoRef.current.srcObject = stream;
-      stageVideoRef.current.play().catch(() => {});
+    const stageEl = stageVideoContainerRef.current;
+    if (!stageEl) return;
+
+    // Priority 1: Local screen share
+    if (shareOn && localScreenTrackRef.current) {
+      localScreenTrackRef.current.play(stageEl);
+      return;
     }
-  }, [pinnedToStage, remoteStreams]);
 
-  // ── Attach local screen share to stage video ──────────
-  useEffect(() => {
-    if (shareOn && screenStreamRef.current && screenVideoRef.current) {
-      screenVideoRef.current.srcObject = screenStreamRef.current;
-      screenVideoRef.current.play().catch(() => {});
+    // Priority 2: Remote screen share
+    if (remoteScreenShare?.videoTrack) {
+      remoteScreenShare.videoTrack.play(stageEl);
+      return;
     }
-  }, [shareOn]);
 
-  // ── Attach remote screen share to stage video ─────────
-  useEffect(() => {
-    if (remoteScreenStream && remoteScreenVideoRef.current) {
-      remoteScreenVideoRef.current.srcObject = remoteScreenStream;
-      remoteScreenVideoRef.current.play().catch(() => {});
-    }
-  }, [remoteScreenStream, remoteSharer]);
-
-  // ── Emit camera:ready once media flow completes + socket is connected ─
-  useEffect(() => {
-    if (cameraReadyEmittedRef.current) return;
-    if (!mediaFlowCompleteRef.current) return;
-
-    const socket = socketRef.current;
-    if (!socket?.connected) return;
-
-    cameraReadyEmittedRef.current = true;
-    console.log("[videocallroom] emitting camera:ready");
-    socket.emit("camera:ready", { roomKey: room });
-
-    // Also check if any remote users are already known as ready
-    // (they may have sent camera:user-ready before our media was done)
-    for (const remoteId of remoteCameraReadyRef.current) {
-      if (socket.id < remoteId && !cameraPeersRef.current[remoteId]) {
-        (async () => {
-          try {
-            const pc = createCameraPeer(remoteId);
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit("camera:offer", { targetSocketId: remoteId, sdp: pc.localDescription });
-          } catch (err) {
-            console.log("[videocallroom] camera offer error (ready-emit):", err);
-          }
-        })();
+    // Priority 3: Pinned remote participant (self handled in Effect 3)
+    if (pinnedToStage && pinnedToStage !== "self") {
+      const agoraUid = getAgoraUidForSocket(pinnedToStage);
+      if (agoraUid != null && remoteUsers[agoraUid]?.videoTrack) {
+        remoteUsers[agoraUid].videoTrack.play(stageEl);
       }
     }
-  }, [camStatus, audioStatus, socketConnected, room]);
+  }, [shareOn, remoteScreenShare, pinnedToStage, remoteUsers, getAgoraUidForSocket]);
+
+  // ────────────────────────────────────────────────────────
+  // Effect 5: Play remote video tracks in circle elements
+  // ────────────────────────────────────────────────────────
+  useEffect(() => {
+    for (const [uidStr, remote] of Object.entries(remoteUsers)) {
+      if (!remote.videoTrack) continue;
+      const uid = Number(uidStr);
+      const info = uidMap[uid];
+      if (!info?.socketId) continue;
+
+      // Skip if this user is pinned to stage (stage effect handles it)
+      const isScreenShareActive = shareOn || !!remoteScreenShare;
+      if (!isScreenShareActive && pinnedToStage === info.socketId) continue;
+
+      const circleEl = document.getElementById(`agora-video-${uid}`);
+      if (circleEl) {
+        remote.videoTrack.play(circleEl);
+      }
+    }
+  }, [remoteUsers, uidMap, pinnedToStage, shareOn, remoteScreenShare, participants]);
 
   // ────────────────────────────────────────────────────────
   // Chat send (via socket)
@@ -753,13 +549,11 @@ function VideoCallRoomInner() {
 
       const socket = socketRef.current;
       if (!socket?.connected) {
-        console.log("[videocallroom] socket not connected, cannot send");
         setNotice("Not connected. Trying to reconnect...");
         setTimeout(() => setNotice(""), 2000);
         return;
       }
 
-      console.log("[videocallroom] chat:send", trimmedText);
       socket.emit("chat:send", {
         roomKey: room,
         userId: user?._id || "",
@@ -767,159 +561,156 @@ function VideoCallRoomInner() {
         email,
         text: trimmedText,
       });
-
       setChatText("");
     },
     [chatText, room, displayName, email, user?._id],
   );
 
   // ────────────────────────────────────────────────────────
-  // Controls (placeholder toggles)
+  // Control functions
   // ────────────────────────────────────────────────────────
-  const [micOn, setMicOn] = useState(true);
-  const [camOn, setCamOn] = useState(true);
-
   const toggleMic = () => {
-    console.log("[videocallroom] toggle mic. before:", micOn);
-
-    setMicOn((previous) => {
-      const next = !previous;
-
-      // actually enable/disable mic track (if available)
-      const audioTrack =
-        audioStreamRef.current?.getAudioTracks?.()?.[0];
-      if (audioTrack) {
-        audioTrack.enabled = next;
-        console.log("[videocallroom] mic track enabled:", audioTrack.enabled);
-      }
-
-      return next;
-    });
+    const track = localAudioTrackRef.current;
+    if (!track) return;
+    const next = !micOn;
+    track.setEnabled(next);
+    setMicOn(next);
+    console.log("[videocallroom] mic toggled:", next);
   };
 
   const toggleCam = () => {
-    console.log("[videocallroom] toggle cam. before:", camOn);
-
-    setCamOn((previous) => {
-      const next = !previous;
-
-      // actually enable/disable cam track (if available)
-      const videoTrack =
-        camStreamRef.current?.getVideoTracks?.()?.[0];
-      if (videoTrack) {
-        videoTrack.enabled = next;
-        console.log("[videocallroom] cam track enabled:", videoTrack.enabled);
-      }
-
-      // Notify other participants so they show initials vs video
-      const socket = socketRef.current;
-      if (socket?.connected) {
-        socket.emit("camera:cam-toggled", { roomKey: room, camOn: next });
-      }
-
-      return next;
-    });
+    const track = localVideoTrackRef.current;
+    if (!track) return;
+    const next = !camOn;
+    track.setEnabled(next);
+    setCamOn(next);
+    console.log("[videocallroom] cam toggled:", next);
   };
 
-  const stopScreenShare = useCallback(() => {
+  const stopScreenShare = useCallback(async () => {
     console.log("[videocallroom] stopping screen share");
-    // Stop local screen tracks
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach((t) => t.stop());
-      screenStreamRef.current = null;
+    if (localScreenTrackRef.current) {
+      localScreenTrackRef.current.close();
+      localScreenTrackRef.current = null;
     }
-    // Close all sharer-side peer connections
-    Object.values(peerConnectionsRef.current).forEach((pc) => pc.close());
-    peerConnectionsRef.current = {};
-
+    if (screenClientRef.current) {
+      try { await screenClientRef.current.leave(); } catch (_) {}
+      screenClientRef.current = null;
+    }
     setShareOn(false);
-
-    // Notify server
-    const socket = socketRef.current;
-    if (socket?.connected) {
-      socket.emit("screenshare:stop", { roomKey: room });
-    }
-  }, [room]);
+  }, []);
 
   const toggleShare = async () => {
     console.log("[videocallroom] toggle screenshare. before:", shareOn);
 
     if (shareOn) {
-      stopScreenShare();
+      await stopScreenShare();
       return;
     }
 
-    // Don't allow sharing if someone else is already sharing
-    if (remoteSharer) {
-      setNotice(`${remoteSharer.name} is already sharing their screen.`);
+    // Don't allow if someone else is sharing
+    if (remoteScreenShare) {
+      setNotice("Someone is already sharing their screen.");
       setTimeout(() => setNotice(""), 2500);
       return;
     }
 
-    // Start sharing
-    try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { cursor: "always" },
-        audio: false,
-      });
+    const AgoraRTC = AgoraRTCRef.current;
+    if (!AgoraRTC) {
+      setNotice("Video service not ready yet.");
+      setTimeout(() => setNotice(""), 2000);
+      return;
+    }
 
-      screenStreamRef.current = stream;
-      setShareOn(true);
+    try {
+      // Create screen track (video only for simplicity)
+      const screenTrack = await AgoraRTC.createScreenVideoTrack(
+        { encoderConfig: "1080p_1" },
+        "disable",
+      );
+
+      const screenVideoTrack = Array.isArray(screenTrack) ? screenTrack[0] : screenTrack;
+      localScreenTrackRef.current = screenVideoTrack;
 
       // Listen for browser's built-in "Stop sharing" button
-      const screenTrack = stream.getVideoTracks()[0];
-      if (screenTrack) {
-        screenTrack.addEventListener("ended", () => {
-          stopScreenShare();
-        });
-      }
+      screenVideoTrack.on("track-ended", () => {
+        stopScreenShare();
+      });
 
-      // Notify server (this triggers screenshare:started broadcast to others)
-      const socket = socketRef.current;
-      if (socket?.connected) {
-        socket.emit("screenshare:start", { roomKey: room });
-      }
+      // Create second client for screen share
+      const screenClient = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+      screenClientRef.current = screenClient;
+
+      const screenUid = myAgoraUid + SCREEN_SHARE_UID_OFFSET;
+
+      // Fetch token for screen share UID
+      const tokenRes = await axios.get(
+        `${API_BASE}/api/v1/agora/token?channel=${encodeURIComponent(room)}&uid=${screenUid}`,
+        { withCredentials: true },
+      );
+      const { token } = tokenRes.data;
+
+      await screenClient.join(AGORA_APP_ID, room, token, screenUid);
+
+      const tracksToPublish = Array.isArray(screenTrack) ? screenTrack : [screenTrack];
+      await screenClient.publish(tracksToPublish);
+
+      setShareOn(true);
+      console.log("[agora] screen share published, uid:", screenUid);
     } catch (err) {
-      console.log("[videocallroom] getDisplayMedia error:", err);
-      if (err?.name === "NotAllowedError") {
+      console.log("[agora] screen share error:", err);
+      if (err?.name === "NotAllowedError" || err?.code === "PERMISSION_DENIED") {
         setNotice("Screen share cancelled.");
       } else {
         setNotice("Could not start screen share.");
       }
       setTimeout(() => setNotice(""), 2500);
+
+      // Cleanup on error
+      if (localScreenTrackRef.current) {
+        localScreenTrackRef.current.close();
+        localScreenTrackRef.current = null;
+      }
+      if (screenClientRef.current) {
+        try { await screenClientRef.current.leave(); } catch (_) {}
+        screenClientRef.current = null;
+      }
     }
   };
 
   const openSettings = () => {
-    console.log("[videocallroom] settings clicked");
     setNotice("Settings (soon).");
     setTimeout(() => setNotice(""), 1800);
   };
 
-  const leaveRoom = () => {
-    console.log("[videocallroom] leave room clicked");
-    // Stop screen share if active
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach((t) => t.stop());
-      screenStreamRef.current = null;
-    }
-    // Close all screen share peer connections
-    Object.values(peerConnectionsRef.current).forEach((pc) => pc.close());
-    peerConnectionsRef.current = {};
-    // Close all camera mesh peer connections
-    cleanupAllCameraPeers();
+  const leaveRoom = async () => {
+    console.log("[videocallroom] leave room");
 
+    // Close local tracks
+    localAudioTrackRef.current?.close();
+    localVideoTrackRef.current?.close();
+    localScreenTrackRef.current?.close();
+    localAudioTrackRef.current = null;
+    localVideoTrackRef.current = null;
+    localScreenTrackRef.current = null;
+
+    // Leave Agora clients
+    try { await screenClientRef.current?.leave(); } catch (_) {}
+    try { await agoraClientRef.current?.leave(); } catch (_) {}
+    screenClientRef.current = null;
+    agoraClientRef.current = null;
+
+    // Disconnect socket
     if (socketRef.current?.connected) {
-      socketRef.current.emit("screenshare:stop", { roomKey: room });
       socketRef.current.emit("room:leave", { roomKey: room });
       socketRef.current.disconnect();
     }
+
     go("/dashboard/videoscreenshare");
   };
 
   // ────────────────────────────────────────────────────────
   // Double-click any circle -> pin/unpin to stage
-  // id = "self" | remoteSocketId
   // ────────────────────────────────────────────────────────
   const togglePinToStage = (id) => {
     console.log("[videocallroom] toggle pin:", id);
@@ -927,19 +718,16 @@ function VideoCallRoomInner() {
   };
 
   // ────────────────────────────────────────────────────────
-  // Fullscreen stage (dblclick or button)
+  // Fullscreen stage
   // ────────────────────────────────────────────────────────
   const enterStageFullscreen = async () => {
     try {
       const stageElement = stageWrapRef.current;
       if (!stageElement) return;
       if (document.fullscreenElement) return;
-
-      console.log("[videocallroom] request fullscreen");
       await stageElement.requestFullscreen();
       setIsStageFullscreen(true);
     } catch (error) {
-      console.log("[videocallroom] fullscreen failed:", error?.message);
       setNotice("Fullscreen blocked by browser.");
       setTimeout(() => setNotice(""), 1500);
     }
@@ -948,12 +736,9 @@ function VideoCallRoomInner() {
   const exitStageFullscreen = async () => {
     try {
       if (!document.fullscreenElement) return;
-      console.log("[videocallroom] exit fullscreen");
       await document.exitFullscreen();
       setIsStageFullscreen(false);
-    } catch (error) {
-      console.log("[videocallroom] exit fullscreen failed:", error?.message);
-    }
+    } catch (_) {}
   };
 
   const toggleStageFullscreen = async () => {
@@ -964,17 +749,54 @@ function VideoCallRoomInner() {
     }
   };
 
-  // Keep state in sync + ESC support
   useEffect(() => {
-    const onFullscreenChange = () => {
-      const isFullscreen = !!document.fullscreenElement;
-      console.log("[videocallroom] fullscreen change:", isFullscreen);
-      setIsStageFullscreen(isFullscreen);
-    };
+    const onFullscreenChange = () => setIsStageFullscreen(!!document.fullscreenElement);
     document.addEventListener("fullscreenchange", onFullscreenChange);
-    return () =>
-      document.removeEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, []);
+
+  // ── beforeunload: best-effort Agora cleanup on tab/browser close ──
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      localAudioTrackRef.current?.close();
+      localVideoTrackRef.current?.close();
+      localScreenTrackRef.current?.close();
+      screenClientRef.current?.leave().catch(() => {});
+      agoraClientRef.current?.leave().catch(() => {});
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
+
+  // ── Helper: determine what's on stage ────────────────────
+  const stageContent = useMemo(() => {
+    if (shareOn) return "local-screen";
+    if (remoteScreenShare?.videoTrack) return "remote-screen";
+    if (pinnedToStage) return "pinned";
+    return "empty";
+  }, [shareOn, remoteScreenShare, pinnedToStage]);
+
+  // ── Helper: get remote screen sharer name ────────────────
+  const remoteScreenSharerName = useMemo(() => {
+    if (!remoteScreenShare) return "";
+    const sharerMainUid = remoteScreenShare.uid - SCREEN_SHARE_UID_OFFSET;
+    return uidMap[sharerMainUid]?.name || "Someone";
+  }, [remoteScreenShare, uidMap]);
+
+  // ── Helper: check if a pinned user has video ─────────────
+  const pinnedHasVideo = useMemo(() => {
+    if (!pinnedToStage) return false;
+    if (pinnedToStage === "self") return camStatus === "ready" && camOn;
+    const agoraUid = getAgoraUidForSocket(pinnedToStage);
+    if (agoraUid == null) return false;
+    return !!remoteUsers[agoraUid]?.hasVideo;
+  }, [pinnedToStage, camStatus, camOn, remoteUsers, getAgoraUidForSocket]);
+
+  const pinnedName = useMemo(() => {
+    if (!pinnedToStage) return "";
+    if (pinnedToStage === "self") return displayName;
+    return participants.find((p) => p.id === pinnedToStage)?.name || "Unknown";
+  }, [pinnedToStage, displayName, participants]);
 
   // ────────────────────────────────────────────────────────
   // RENDER
@@ -1098,76 +920,53 @@ function VideoCallRoomInner() {
                   : "h-[46vh] min-h-[260px] sm:h-[54vh]"
               }`}
             >
-              {/* Priority 1: local screen share */}
-              {shareOn ? (
+              {/* Agora video container for stage (always mounted, visibility controlled) */}
+              <div
+                ref={stageVideoContainerRef}
+                className="h-full w-full"
+                style={{
+                  display: stageContent !== "empty" && (stageContent !== "pinned" || pinnedHasVideo) ? "block" : "none",
+                }}
+              />
+
+              {/* Stage labels / overlays */}
+              {stageContent === "local-screen" && (
+                <div className="absolute bottom-3 left-3 z-10 rounded-xl border border-white/10 bg-black/60 px-3 py-1.5 text-xs font-bold text-green-400/90 shadow-lg">
+                  You are sharing your screen
+                </div>
+              )}
+
+              {stageContent === "remote-screen" && (
                 <>
-                  <video
-                    ref={screenVideoRef}
-                    muted
-                    playsInline
-                    className="h-full w-full object-contain"
-                    aria-label="Your screen share"
-                  />
-                  <div className="absolute bottom-3 left-3 z-10 rounded-xl border border-white/10 bg-black/60 px-3 py-1.5 text-xs font-bold text-green-400/90 shadow-lg">
-                    You are sharing your screen
-                  </div>
-                </>
-              ) : /* Priority 2: remote screen share */
-              remoteSharer ? (
-                <>
-                  <video
-                    ref={remoteScreenVideoRef}
-                    playsInline
-                    className="h-full w-full object-contain"
-                    aria-label={`${remoteSharer.name}'s screen share`}
-                  />
-                  {!remoteScreenStream && (
+                  {!remoteScreenShare?.videoTrack && (
                     <div className="absolute inset-0 flex items-center justify-center">
                       <p className="text-sm text-white/60">Connecting to screen share...</p>
                     </div>
                   )}
                   <div className="absolute bottom-3 left-3 z-10 rounded-xl border border-white/10 bg-black/60 px-3 py-1.5 text-xs font-bold text-blue-400/90 shadow-lg">
-                    {remoteSharer.name} is sharing their screen
+                    {remoteScreenSharerName} is sharing their screen
                   </div>
                 </>
-              ) : /* Priority 3: any participant pinned to stage */
-              pinnedToStage ? (
-                (() => {
-                  const isSelf = pinnedToStage === "self";
-                  const hasSelfVideo = isSelf && camStatus === "ready" && camOn;
-                  const remoteStream = !isSelf ? remoteStreams[pinnedToStage] : null;
-                  const remoteCamOn = !isSelf ? remoteCamStatus[pinnedToStage] !== false : true;
-                  const hasRemoteVideo = remoteStream?.getVideoTracks()?.length > 0 && remoteCamOn;
-                  const pinnedName = isSelf
-                    ? displayName
-                    : participants.find((p) => p.id === pinnedToStage)?.name || "Unknown";
+              )}
 
-                  return hasSelfVideo || hasRemoteVideo ? (
-                    <>
-                      <video
-                        ref={stageVideoRef}
-                        muted={isSelf}
-                        playsInline
-                        className="h-full w-full object-cover"
-                        aria-label={`${pinnedName}'s video on stage`}
-                      />
-                      <div className="absolute bottom-3 left-3 z-10 rounded-xl border border-white/10 bg-black/60 px-3 py-1.5 text-xs font-bold text-white/80 shadow-lg">
-                        {isSelf ? "You" : pinnedName} (pinned)
-                      </div>
-                    </>
-                  ) : (
-                    <div className="px-6 text-center">
-                      <p className="text-sm font-bold text-white/85">
-                        {pinnedName} (pinned)
-                      </p>
-                      <p className="mt-1 text-xs text-white/55">
-                        Camera not available.
-                      </p>
-                    </div>
-                  );
-                })()
-              ) : (
-                /* Default: empty stage placeholder */
+              {stageContent === "pinned" && pinnedHasVideo && (
+                <div className="absolute bottom-3 left-3 z-10 rounded-xl border border-white/10 bg-black/60 px-3 py-1.5 text-xs font-bold text-white/80 shadow-lg">
+                  {pinnedToStage === "self" ? "You" : pinnedName} (pinned)
+                </div>
+              )}
+
+              {stageContent === "pinned" && !pinnedHasVideo && (
+                <div className="px-6 text-center">
+                  <p className="text-sm font-bold text-white/85">
+                    {pinnedName} (pinned)
+                  </p>
+                  <p className="mt-1 text-xs text-white/55">
+                    Camera not available.
+                  </p>
+                </div>
+              )}
+
+              {stageContent === "empty" && (
                 <div className="px-6 text-center">
                   <p className="text-sm font-bold text-white/85">
                     Screen Share Area
@@ -1198,13 +997,10 @@ function VideoCallRoomInner() {
                     <div className={`h-20 w-20 overflow-hidden rounded-full border-2 bg-white/10 shadow-2xl sm:h-24 sm:w-24 ${
                       pinnedToStage === "self" ? "border-green-400/60 ring-2 ring-green-400/30" : "border-purple-400/40"
                     }`}>
-                      {camStatus === "ready" && camOn ? (
-                        <video
-                          ref={camVideoRef}
-                          muted
-                          playsInline
-                          className="h-full w-full object-cover"
-                          aria-label="Your camera preview"
+                      {camStatus === "ready" && camOn && !(pinnedToStage === "self" && stageContent === "pinned") ? (
+                        <div
+                          ref={selfVideoContainerRef}
+                          className="h-full w-full"
                         />
                       ) : (
                         <div className="flex h-full w-full items-center justify-center bg-linear-to-b from-white/10 to-white/5">
@@ -1242,11 +1038,11 @@ function VideoCallRoomInner() {
                     const parts = (p.name || "U").trim().split(/\s+/).filter(Boolean);
                     return ((parts[0]?.[0] || "U") + (parts[1]?.[0] || "")).toUpperCase();
                   })();
-                  const stream = remoteStreams[p.id];
-                  const hasVideo = stream?.getVideoTracks()?.length > 0;
-                  const remoteCamOn = remoteCamStatus[p.id] !== false; // default true
-
+                  const agoraUid = getAgoraUidForSocket(p.id);
+                  const remote = agoraUid != null ? remoteUsers[agoraUid] : null;
+                  const hasVideo = !!remote?.hasVideo;
                   const isPinned = pinnedToStage === p.id;
+                  const showVideoInCircle = hasVideo && !(isPinned && stageContent === "pinned");
 
                   return (
                     <div key={p.id} className="flex shrink-0 flex-col items-center">
@@ -1261,18 +1057,10 @@ function VideoCallRoomInner() {
                           <div className={`h-20 w-20 overflow-hidden rounded-full border-2 bg-white/10 shadow-2xl sm:h-24 sm:w-24 ${
                             isPinned ? "border-green-400/60 ring-2 ring-green-400/30" : "border-white/20"
                           }`}>
-                            {stream && hasVideo && remoteCamOn ? (
-                              <video
-                                ref={(el) => {
-                                  if (el && stream && el.srcObject !== stream) {
-                                    el.srcObject = stream;
-                                    el.play().catch(() => {});
-                                  }
-                                }}
-                                autoPlay
-                                playsInline
-                                className="h-full w-full object-cover"
-                                aria-label={`${p.name}'s camera`}
+                            {showVideoInCircle ? (
+                              <div
+                                id={agoraUid != null ? `agora-video-${agoraUid}` : undefined}
+                                className="h-full w-full"
                               />
                             ) : (
                               <div className="flex h-full w-full items-center justify-center bg-linear-to-b from-white/10 to-white/5">
@@ -1284,23 +1072,9 @@ function VideoCallRoomInner() {
                           </div>
                         </button>
 
-                        {/* Hidden audio element — plays remote audio when video is off or unavailable */}
-                        {stream && (!hasVideo || !remoteCamOn) && (
-                          <audio
-                            ref={(el) => {
-                              if (el && stream && el.srcObject !== stream) {
-                                el.srcObject = stream;
-                                el.play().catch(() => {});
-                              }
-                            }}
-                            autoPlay
-                            className="hidden"
-                          />
-                        )}
-
                         {/* Online dot */}
                         <div className="absolute -bottom-1 -right-1 h-5 w-5 rounded-full border-2 border-white/20 bg-black/70 p-0.5 shadow-lg">
-                          <div className={`h-full w-full rounded-full ${stream ? "bg-green-400/80" : "bg-yellow-400/70"}`} />
+                          <div className={`h-full w-full rounded-full ${remote ? "bg-green-400/80" : "bg-yellow-400/70"}`} />
                         </div>
                       </div>
                       <p className="mt-1.5 max-w-[96px] truncate text-center text-[11px] font-semibold text-white/70">
@@ -1329,13 +1103,13 @@ function VideoCallRoomInner() {
                 label={
                   shareOn
                     ? "Stop Share"
-                    : remoteSharer
-                      ? `${remoteSharer.name} sharing`
+                    : remoteScreenShare
+                      ? `${remoteScreenSharerName} sharing`
                       : "Share Screen"
                 }
                 onClick={toggleShare}
                 active={shareOn}
-                disabled={!!remoteSharer && !shareOn}
+                disabled={!!remoteScreenShare && !shareOn}
                 icon="🖥️"
               />
               <CtrlButton
